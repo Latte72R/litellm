@@ -27,10 +27,10 @@ from litellm.caching.affinity_cache import (
     set_local_affinity_pin,
 )
 from litellm.caching.dual_cache import DualCache
-from litellm.router_utils.client_initalization_utils import MaxParallelRequestsLimit
 from litellm.constants import SESSION_DEPLOYMENT_AFFINITY_TTL_METADATA_KEY, SESSION_ID_GENERATED_METADATA_KEY
 from litellm.integrations.custom_logger import CustomLogger, Span
 from litellm.responses.utils import ResponsesAPIRequestUtils
+from litellm.router_utils.client_initalization_utils import MaxParallelRequestsLimit
 from litellm.types.llms.openai import AllMessageValues
 from litellm.types.utils import CallTypes
 
