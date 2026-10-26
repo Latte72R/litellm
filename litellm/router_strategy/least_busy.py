@@ -187,9 +187,21 @@ class LeastBusyLoggingHandler(CustomLogger):
             except Exception as e:
                 _warn_unreadable(model_group, e)
             else:
-                return _least_busy(healthy_deployments, shared, weighted=self.weighted, model_group=model_group, request_kwargs=request_kwargs)
+                return _least_busy(
+                    healthy_deployments,
+                    shared,
+                    weighted=self.weighted,
+                    model_group=model_group,
+                    request_kwargs=request_kwargs,
+                )
         local: Final = _local_counts(self.router_cache.batch_get_cache(list(keys), local_only=True), keys)
-        return _least_busy(healthy_deployments, local, weighted=self.weighted, model_group=model_group, request_kwargs=request_kwargs)
+        return _least_busy(
+            healthy_deployments,
+            local,
+            weighted=self.weighted,
+            model_group=model_group,
+            request_kwargs=request_kwargs,
+        )
 
     @with_service_target("router_usage")
     async def async_get_available_deployments(
@@ -204,9 +216,21 @@ class LeastBusyLoggingHandler(CustomLogger):
             except Exception as e:
                 _warn_unreadable(model_group, e)
             else:
-                return _least_busy(healthy_deployments, shared, weighted=self.weighted, model_group=model_group, request_kwargs=request_kwargs)
+                return _least_busy(
+                    healthy_deployments,
+                    shared,
+                    weighted=self.weighted,
+                    model_group=model_group,
+                    request_kwargs=request_kwargs,
+                )
         local: Final = _local_counts(await self.router_cache.async_batch_get_cache(list(keys), local_only=True), keys)
-        return _least_busy(healthy_deployments, local, weighted=self.weighted, model_group=model_group, request_kwargs=request_kwargs)
+        return _least_busy(
+            healthy_deployments,
+            local,
+            weighted=self.weighted,
+            model_group=model_group,
+            request_kwargs=request_kwargs,
+        )
 
     def _increment(self, kwargs: Mapping[str, object], delta: int) -> None:
         ref: Final = _deployment_ref(kwargs)
