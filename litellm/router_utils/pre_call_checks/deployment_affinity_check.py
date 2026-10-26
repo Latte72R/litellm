@@ -27,6 +27,7 @@ from litellm.caching.affinity_cache import (
     set_local_affinity_pin,
 )
 from litellm.caching.dual_cache import DualCache
+from litellm.router_utils.client_initalization_utils import MaxParallelRequestsLimit
 from litellm.constants import SESSION_DEPLOYMENT_AFFINITY_TTL_METADATA_KEY, SESSION_ID_GENERATED_METADATA_KEY
 from litellm.integrations.custom_logger import CustomLogger, Span
 from litellm.responses.utils import ResponsesAPIRequestUtils
@@ -86,6 +87,7 @@ class DeploymentAffinityCheck(CustomLogger):
         enable_session_id_affinity: bool = False,
         model_group_affinity_config: dict[str, list[str]] | None = None,
         is_priority_group: Callable[[str], bool] | None = None,
+        capacity_aware: bool = False,
     ):
         super().__init__()
         self.cache = cache
@@ -95,6 +97,7 @@ class DeploymentAffinityCheck(CustomLogger):
         self.enable_session_id_affinity = enable_session_id_affinity
         self.model_group_affinity_config: dict[str, list[str]] = model_group_affinity_config or {}
         self.is_priority_group = is_priority_group
+        self.capacity_aware = capacity_aware
 
     def _get_effective_flags(self, model_group: str) -> tuple[bool, bool, bool]:
         """
@@ -352,6 +355,19 @@ class DeploymentAffinityCheck(CustomLogger):
         return None
 
     @with_service_target(ROUTER_SESSION_PINS_TARGET)
+    def _has_capacity(self, deployment: Mapping[str, object]) -> bool:
+        """Check deployment-specific slots before strategy selection.
+
+        Counts are worker-local and are only a preflight hint: acquire() is
+        still authoritative and may fail if another request races us.
+        """
+        info = deployment.get("model_info")
+        model_id = info.get("id") if isinstance(info, Mapping) else None
+        if model_id is None:
+            return True
+        limit = self.cache.get_cache(key=f"{model_id}_max_parallel_requests_client", local_only=True)
+        return not isinstance(limit, MaxParallelRequestsLimit) or limit.in_flight < limit.max_parallel_requests
+
     async def async_filter_deployments(
         self,
         model: str,
@@ -395,6 +411,14 @@ class DeploymentAffinityCheck(CustomLogger):
 
         if self.is_priority_group is not None and self.is_priority_group(model):
             return typed_healthy_deployments
+
+        if self.capacity_aware:
+            # Let the configured Router strategy choose among candidates with
+            # available slots, rather than choosing a fallback here.
+            with_capacity = [deployment for deployment in typed_healthy_deployments if self._has_capacity(deployment)]
+            if with_capacity:
+                typed_healthy_deployments = with_capacity
+            # If all are full, let the normal concurrency limiter report 429.
 
         stable_model_map_key: Final = self._get_stable_model_map_key_from_deployments(
             healthy_deployments=typed_healthy_deployments
