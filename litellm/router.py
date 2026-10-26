@@ -918,6 +918,7 @@ class Router:
     default_cache_time_seconds: int = 1 * 60 * 60  # 1 hour
     tenacity = None
     leastbusy_logger: LeastBusyLoggingHandler | None = None
+    weightedleastbusy_logger: LeastBusyLoggingHandler | None = None
     lowesttpm_logger: LowestTPMLoggingHandler | None = None
     optional_callbacks: list[CustomLogger | Callable | str] | None = None
 
@@ -1469,6 +1470,7 @@ class Router:
     # double as `CustomLogger` callbacks, hence the legacy `*_logger` attrs.)
     _DEFAULT_SELECTOR_ATTR_BY_STRATEGY: dict[str, str] = {
         "least-busy": "leastbusy_logger",
+        "weighted-least-busy": "weightedleastbusy_logger",
         "usage-based-routing": "lowesttpm_logger",
         "usage-based-routing-v2": "lowesttpm_logger_v2",
         "latency-based-routing": "lowestlatency_logger",
@@ -1502,8 +1504,11 @@ class Router:
         """
         selector: RouterStrategySelector | None = None
         match self._normalize_strategy(strategy):
-            case RoutingStrategy.LEAST_BUSY.value:
-                selector = LeastBusyLoggingHandler(router_cache=self.cache)
+            case RoutingStrategy.LEAST_BUSY.value | RoutingStrategy.WEIGHTED_LEAST_BUSY.value:
+                selector = LeastBusyLoggingHandler(
+                    router_cache=self.cache,
+                    weighted=self._normalize_strategy(strategy) == RoutingStrategy.WEIGHTED_LEAST_BUSY.value,
+                )
             case RoutingStrategy.USAGE_BASED_ROUTING.value:
                 selector = LowestTPMLoggingHandler(
                     router_cache=self.cache,
@@ -1609,6 +1614,7 @@ class Router:
         self._override_selectors = {}
 
         self.leastbusy_logger: LeastBusyLoggingHandler | None = None
+        self.weightedleastbusy_logger: LeastBusyLoggingHandler | None = None
         self.lowesttpm_logger: LowestTPMLoggingHandler | None = None
         self.lowesttpm_logger_v2: LowestTPMLoggingHandler_v2 | None = None
         self.lowestlatency_logger: LowestLatencyLoggingHandler | None = None
@@ -1971,10 +1977,11 @@ class Router:
         if selector is None:
             return None
         match strategy:
-            case "least-busy":
+            case "least-busy" | "weighted-least-busy":
                 return await selector.async_get_available_deployments(
                     model_group=model,
                     healthy_deployments=healthy_deployments,
+                    request_kwargs=request_kwargs,
                 )
             case "usage-based-routing":
                 # `LowestTPMLoggingHandler` (v1) only exposes the sync
@@ -2027,10 +2034,11 @@ class Router:
         # `LowestCostLoggingHandler` only implements
         # `async_get_available_deployments`
         match strategy:
-            case "least-busy":
+            case "least-busy" | "weighted-least-busy":
                 return selector.get_available_deployments(
                     model_group=model,
                     healthy_deployments=healthy_deployments,
+                    request_kwargs=request_kwargs,
                 )
             case "usage-based-routing" | "usage-based-routing-v2":
                 return selector.get_available_deployments(
@@ -13792,7 +13800,7 @@ class Router:
             and self.routing_strategy != "simple-shuffle"
             and self.routing_strategy != "cost-based-routing"
             and self.routing_strategy != "latency-based-routing"
-            and self.routing_strategy != "least-busy"
+            and self.routing_strategy not in ("least-busy", "weighted-least-busy")
         ):  # prevent regressions for other routing strategies, that don't have async get available deployments implemented.
             return self.get_available_deployment(
                 model=model,
