@@ -125,3 +125,61 @@ async def claim_affinity_pin(
         except Exception as error:  # noqa: BLE001  # Redis/Lua faults retain same-pod affinity through local claims
             verbose_router_logger.debug("Affinity cache: Redis claim failed, using pod-local claim. error=%s", error)
     return claim_affinity_pin_in_memory(cache, cache_key, pin_value, ttl_seconds, eligible_values=eligible_values)
+
+
+
+# Conditional write: only replace a session's cached deployment if it is
+# still the original deployment observed by this request.
+_COMPARE_AND_SWAP_PIN_SCRIPT: Final = """
+local current = redis.call('GET', KEYS[1])
+if not current then return 0 end
+local model_id = current
+local ok, decoded = pcall(cjson.decode, current)
+if ok and type(decoded) == 'table' then
+  model_id = tostring(decoded['model_id'] or '')
+elseif ok and type(decoded) == 'string' then
+  model_id = decoded
+end
+if model_id ~= ARGV[1] then return 0 end
+redis.call('SET', KEYS[1], ARGV[2], 'EX', ARGV[3])
+return 1
+"""
+
+
+async def compare_and_swap_affinity_pin(
+    cache: DualCache,
+    cache_key: str,
+    expected_model_id: str,
+    new_model_id: str,
+    ttl_seconds: int,
+) -> bool:
+    """Atomically repin a successful failover; avoid stealing concurrent pins.
+
+    On Redis failure leave the shared pin unchanged; never fail the response.
+    When Redis is not configured use the existing pod-local affinity cache.
+    """
+    pin_value = {"model_id": new_model_id}
+    redis_cache = cache.redis_cache
+    if redis_cache is not None:
+        try:
+            script = redis_cache.async_register_script(_COMPARE_AND_SWAP_PIN_SCRIPT)
+            updated = await script(
+                keys=(cache_key,),
+                args=(expected_model_id, json.dumps(pin_value), int(ttl_seconds)),
+            )
+            if int(updated) == 1:
+                set_local_affinity_pin(cache, cache_key, pin_value, ttl_seconds)
+                return True
+            # Avoid selecting an old local pin after another writer has moved it.
+            cache.in_memory_cache.delete_cache(cache_key)
+            return False
+        except Exception as error:
+            verbose_router_logger.debug("Session affinity CAS skipped on Redis error: %s", error)
+            return False
+
+    old_pin = cache.in_memory_cache.get_cache(cache_key)
+    old_id = old_pin.get("model_id") if isinstance(old_pin, Mapping) else old_pin
+    if str(old_id) != expected_model_id:
+        return False
+    set_local_affinity_pin(cache, cache_key, pin_value, ttl_seconds)
+    return True

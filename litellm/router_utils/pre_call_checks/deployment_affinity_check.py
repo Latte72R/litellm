@@ -368,6 +368,50 @@ class DeploymentAffinityCheck(CustomLogger):
         limit = self.cache.get_cache(key=f"{model_id}_max_parallel_requests_client", local_only=True)
         return not isinstance(limit, MaxParallelRequestsLimit) or limit.in_flight < limit.max_parallel_requests
 
+    async def async_repin_after_success(self, request_kwargs: Mapping[str, object]) -> None:
+        """Move a previously selected session pin only after provider success.
+
+        The routing step stores the observed old pin in request metadata. The
+        compare-and-swap ensures a delayed completion cannot overwrite a pin
+        which another request already moved.
+        """
+        if not self.capacity_aware:
+            return
+        metadata_dicts = self._iter_metadata_dicts(request_kwargs)
+        expected_model_id = self._first_metadata_value(metadata_dicts, "_session_affinity_repin_expected")
+        model_group = self._first_metadata_value(metadata_dicts, "deployment_model_name")
+        if not expected_model_id or not model_group:
+            return
+        session_id = self._get_session_id_from_request_kwargs(dict(request_kwargs))
+        if session_id is None:
+            return
+        model_info = request_kwargs.get("model_info")
+        if not isinstance(model_info, Mapping):
+            model_info = next(
+                (bucket.get("model_info") for bucket in metadata_dicts
+                 if isinstance(bucket.get("model_info"), Mapping)),
+                None,
+            )
+        new_model_id = model_info.get("id") if isinstance(model_info, Mapping) else None
+        if new_model_id is None or str(new_model_id) == expected_model_id:
+            return
+
+        from litellm.caching.affinity_cache import compare_and_swap_affinity_pin
+
+        cache_key = self.get_session_affinity_cache_key(
+            model_group=model_group,
+            session_id=session_id,
+            user_key=self.get_user_key_from_request_kwargs(request_kwargs),
+        )
+        ttl = self._get_marker_session_affinity_ttl(dict(request_kwargs)) or self.ttl_seconds
+        await compare_and_swap_affinity_pin(
+            cache=self.cache,
+            cache_key=cache_key,
+            expected_model_id=expected_model_id,
+            new_model_id=str(new_model_id),
+            ttl_seconds=ttl,
+        )
+
     async def async_filter_deployments(
         self,
         model: str,
@@ -450,10 +494,20 @@ class DeploymentAffinityCheck(CustomLogger):
                 elif isinstance(session_cache_result, str):
                     session_model_id = session_cache_result
 
+                retry_skips = request_kwargs.get("_retry_skipped_deployment_ids")
+                skipped_ids = (
+                    {str(item) for item in retry_skips}
+                    if self.capacity_aware and isinstance(retry_skips, (tuple, list, set, frozenset))
+                    else set()
+                )
                 if session_model_id:
-                    session_deployment: Final = self._find_deployment_by_model_id(
-                        healthy_deployments=typed_healthy_deployments,
-                        model_id=session_model_id,
+                    session_deployment: Final = (
+                        None
+                        if session_model_id in skipped_ids
+                        else self._find_deployment_by_model_id(
+                            healthy_deployments=typed_healthy_deployments,
+                            model_id=session_model_id,
+                        )
                     )
                     if session_deployment is not None:
                         verbose_router_logger.debug(
@@ -463,6 +517,13 @@ class DeploymentAffinityCheck(CustomLogger):
                         )
                         return [session_deployment]
                     else:
+                        if self.capacity_aware:
+                            # The pin is unfit for this request (failed or full).
+                            # Preserve its identity until a replacement succeeds.
+                            for key in ("metadata", "litellm_metadata"):
+                                bucket = request_kwargs.get(key)
+                                if isinstance(bucket, dict):
+                                    bucket["_session_affinity_repin_expected"] = session_model_id
                         verbose_router_logger.debug(
                             "DeploymentAffinityCheck: session-id pinned deployment=%s not found in healthy_deployments",
                             session_model_id,
