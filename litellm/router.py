@@ -8023,14 +8023,18 @@ class Router:
             )
 
     @staticmethod
-    def _deployment_ids_to_skip_on_retry(exception: Exception, already_skipped: object) -> tuple[str, ...]:
+    def _deployment_ids_to_skip_on_retry(
+        exception: Exception,
+        already_skipped: object,
+        include_retryable: bool = False,
+    ) -> tuple[str, ...]:
         failed_deployment_id: Final[str | None] = getattr(exception, "retry_skip_deployment_id", None) or getattr(
             exception, "failed_deployment_id", None
         )
         status_code: Final = getattr(exception, "status_code", None)
         if not failed_deployment_id or not isinstance(status_code, int):
             return ()
-        if litellm.should_retry(status_code):
+        if litellm.should_retry(status_code) and not include_retryable:
             return ()
         already_skipped_ids: Final = _as_retry_skipped_deployment_ids(already_skipped)
         skipped: Final = tuple(sorted(frozenset((*already_skipped_ids, failed_deployment_id))))
@@ -8139,6 +8143,10 @@ class Router:
                 first_skipped_ids: Final = self._deployment_ids_to_skip_on_retry(
                     exception=original_exception,
                     already_skipped=kwargs.get("_retry_skipped_deployment_ids"),
+                    include_retryable=(
+                        self.session_affinity_capacity_aware
+                        and DeploymentAffinityCheck._get_session_id_from_request_kwargs(kwargs) is not None
+                    ),
                 )
                 if first_skipped_ids:
                     kwargs["_retry_skipped_deployment_ids"] = first_skipped_ids  # rebind-ok: the next attempt reads it
@@ -8214,6 +8222,10 @@ class Router:
                     skipped_ids = self._deployment_ids_to_skip_on_retry(
                         exception=e,
                         already_skipped=kwargs.get("_retry_skipped_deployment_ids"),
+                        include_retryable=(
+                            self.session_affinity_capacity_aware
+                            and DeploymentAffinityCheck._get_session_id_from_request_kwargs(kwargs) is not None
+                        ),
                     )
                     if skipped_ids:
                         kwargs["_retry_skipped_deployment_ids"] = skipped_ids  # rebind-ok: the next attempt reads it
@@ -8448,6 +8460,21 @@ class Router:
             deployment_id: Final = model_info.get("id", None)
             if model_group is None or deployment_id is None or self.get_deployment(model_id=str(deployment_id)) is None:
                 return
+
+            # The replacement session pin is updated only after provider success.
+            # Session affinity is an optimization: a Redis failure must never
+            # turn a successful model response into an error.
+            if self.session_affinity_capacity_aware:
+                try:
+                    affinity_callback = next(
+                        (callback for callback in (self.optional_callbacks or [])
+                         if isinstance(callback, DeploymentAffinityCheck)),
+                        None,
+                    )
+                    if affinity_callback is not None:
+                        await affinity_callback.async_repin_after_success(litellm_params)
+                except Exception as repin_error:
+                    verbose_router_logger.debug("Session affinity repin failed: %s", repin_error)
 
             # Always track deployment successes for cooldown logic, regardless of TPM/RPM limits
             increment_deployment_successes_for_current_minute(
