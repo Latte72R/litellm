@@ -176,7 +176,9 @@ class LeastBusyLoggingHandler(CustomLogger):
 
     @with_service_target("router_usage")
     def get_available_deployments(
-        self, model_group: str, healthy_deployments: Sequence[Mapping[str, object]],
+        self,
+        model_group: str,
+        healthy_deployments: Sequence[Mapping[str, object]],
         request_kwargs: Mapping[str, object] | None = None,
     ) -> Mapping[str, object] | None:
         keys: Final = _request_count_keys(model_group, healthy_deployments)
@@ -205,7 +207,9 @@ class LeastBusyLoggingHandler(CustomLogger):
 
     @with_service_target("router_usage")
     async def async_get_available_deployments(
-        self, model_group: str, healthy_deployments: Sequence[Mapping[str, object]],
+        self,
+        model_group: str,
+        healthy_deployments: Sequence[Mapping[str, object]],
         request_kwargs: Mapping[str, object] | None = None,
     ) -> Mapping[str, object] | None:
         keys: Final = _request_count_keys(model_group, healthy_deployments)
