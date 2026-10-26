@@ -45,6 +45,7 @@ AgenticSurface: TypeAlias = Literal["chat_completions", "responses"]
 RoutingStrategyName: TypeAlias = Literal[
     "simple-shuffle",
     "least-busy",
+    "weighted-least-busy",
     "usage-based-routing",
     "latency-based-routing",
     "cost-based-routing",

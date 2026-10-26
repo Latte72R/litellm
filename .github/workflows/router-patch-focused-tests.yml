@@ -1,0 +1,55 @@
+name: Router patch focused tests
+
+on:
+  pull_request:
+    paths:
+      - "litellm/router.py"
+      - "litellm/router_strategy/least_busy.py"
+      - "litellm/router_utils/pre_call_checks/deployment_affinity_check.py"
+      - "litellm/caching/affinity_cache.py"
+      - "tests/unit/router_strategy/test_weighted_least_busy.py"
+      - "tests/unit/router_utils/pre_call_checks/test_session_affinity_capacity.py"
+      - "tests/unit/router_utils/pre_call_checks/test_session_affinity_repin.py"
+      - ".github/workflows/router-patch-focused-tests.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  focused-router-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      LITELLM_LOCAL_MODEL_COST_MAP: "True"
+      UV_PYTHON: "3.12"
+    steps:
+      - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          enable-cache: true
+      - name: Install locked development dependencies
+        run: uv sync --frozen --no-install-project
+      - name: Run focused routing tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          candidates=(
+            tests/unit/router_strategy/test_weighted_least_busy.py
+            tests/unit/router_utils/pre_call_checks/test_session_affinity_capacity.py
+            tests/unit/router_utils/pre_call_checks/test_session_affinity_repin.py
+          )
+          selected=()
+          for f in "${candidates[@]}"; do
+            if [[ -f "$f" ]]; then selected+=("$f"); fi
+          done
+          if (( ${#selected[@]} == 0 )); then
+            echo "No focused tests found" >&2
+            exit 1
+          fi
+          uv run --no-sync pytest -q --tb=short "${selected[@]}"
