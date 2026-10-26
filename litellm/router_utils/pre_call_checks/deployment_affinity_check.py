@@ -489,13 +489,14 @@ class DeploymentAffinityCheck(CustomLogger):
                 skipped = request_kwargs.get("_retry_skipped_deployment_ids") or ()
                 if not isinstance(skipped, (tuple, list, set, frozenset)):
                     skipped = ()
-                if self.capacity_aware and session_model_id and session_model_id in skipped:
-                    session_model_id = None
+                pinned_was_skipped = self.capacity_aware and session_model_id in skipped
 
                 if session_model_id:
-                    session_deployment: Final = self._find_deployment_by_model_id(
-                        healthy_deployments=typed_healthy_deployments,
-                        model_id=session_model_id,
+                    session_deployment: Final = (
+                        None if pinned_was_skipped else self._find_deployment_by_model_id(
+                            healthy_deployments=typed_healthy_deployments,
+                            model_id=session_model_id,
+                        )
                     )
                     if session_deployment is not None:
                         verbose_router_logger.debug(
