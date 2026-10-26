@@ -125,3 +125,48 @@ async def claim_affinity_pin(
         except Exception as error:  # noqa: BLE001  # Redis/Lua faults retain same-pod affinity through local claims
             verbose_router_logger.debug("Affinity cache: Redis claim failed, using pod-local claim. error=%s", error)
     return claim_affinity_pin_in_memory(cache, cache_key, pin_value, ttl_seconds, eligible_values=eligible_values)
+
+# A session may be moved only if the value observed during routing is still current.
+# The Redis script avoids a concurrent response overwriting a newer session pin.
+_COMPARE_AND_SWAP_PIN_SCRIPT: Final = """
+local current = redis.call('GET', KEYS[1])
+if not current then return 0 end
+local found = current
+local decoded, value = pcall(cjson.decode, current)
+if decoded and type(value) == 'table' and value['model_id'] then
+  found = tostring(value['model_id'])
+elseif decoded and type(value) == 'string' then
+  found = value
+end
+if found ~= ARGV[1] then return 0 end
+redis.call('SET', KEYS[1], ARGV[2], 'EX', ARGV[3])
+return 1
+"""
+
+
+async def compare_and_swap_affinity_pin(
+    cache: DualCache, key: str, expected_model_id: str, new_model_id: str, ttl_seconds: int
+) -> bool:
+    redis_cache = cache.redis_cache
+    value = {"model_id": new_model_id}
+    if redis_cache is not None:
+        try:
+            script = redis_cache.async_register_script(_COMPARE_AND_SWAP_PIN_SCRIPT)
+            updated = await script(
+                keys=(key,), args=(expected_model_id, json.dumps(value), int(ttl_seconds))
+            )
+            if int(updated) == 1:
+                set_local_affinity_pin(cache, key, value, ttl_seconds)
+                return True
+            # A concurrent request won. Discard stale local state.
+            cache.in_memory_cache.delete_cache(key)
+            return False
+        except Exception as error:
+            verbose_router_logger.debug("Affinity CAS Redis failure: %s", error)
+            return False
+    existing = cache.in_memory_cache.get_cache(key)
+    stored = existing.get("model_id") if isinstance(existing, Mapping) else existing
+    if stored != expected_model_id:
+        return False
+    set_local_affinity_pin(cache, key, value, ttl_seconds)
+    return True

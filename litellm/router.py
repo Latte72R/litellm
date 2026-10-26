@@ -978,6 +978,7 @@ class Router:
         alerting_config: AlertingConfig | None = None,
         router_general_settings: RouterGeneralSettings | None = RouterGeneralSettings(),
         deployment_affinity_ttl_seconds: int = 3600,
+        session_affinity_capacity_aware: bool = False,
         model_group_affinity_config: dict[str, list[str]] | None = None,
         ignore_invalid_deployments: bool = False,
         enable_health_check_routing: bool = False,
@@ -1189,6 +1190,7 @@ class Router:
         self._provider_unresolved_deployments: tuple[Callable[[], Deployment | None], ...] = ()
 
         self.deployment_affinity_ttl_seconds = deployment_affinity_ttl_seconds
+        self.session_affinity_capacity_aware = session_affinity_capacity_aware
         self.model_group_affinity_config = model_group_affinity_config
         warn_on_unknown_model_group_affinity_flags(model_group_affinity_config)
 
@@ -2478,6 +2480,7 @@ class Router:
             enable_session_id_affinity=False,
             model_group_affinity_config=self.model_group_affinity_config,
             is_priority_group=self._is_priority_routing_group,
+            capacity_aware=self.session_affinity_capacity_aware,
         )
         self.optional_callbacks.append(affinity_callback)
         litellm.logging_callback_manager.add_litellm_callback(affinity_callback)
@@ -2513,6 +2516,7 @@ class Router:
                     existing_affinity_callback.enable_session_id_affinity or enable_session_id_affinity
                 )
                 existing_affinity_callback.ttl_seconds = self.deployment_affinity_ttl_seconds
+                existing_affinity_callback.capacity_aware = self.session_affinity_capacity_aware
                 if self.model_group_affinity_config:
                     existing_affinity_callback.model_group_affinity_config = self.model_group_affinity_config
             else:
@@ -2524,6 +2528,7 @@ class Router:
                     enable_session_id_affinity=enable_session_id_affinity,
                     model_group_affinity_config=self.model_group_affinity_config,
                     is_priority_group=self._is_priority_routing_group,
+                    capacity_aware=self.session_affinity_capacity_aware,
                 )
                 self.optional_callbacks.append(affinity_callback)
                 litellm.logging_callback_manager.add_litellm_callback(affinity_callback)
@@ -8033,8 +8038,9 @@ class Router:
         status_code: Final = getattr(exception, "status_code", None)
         if not failed_deployment_id or not isinstance(status_code, int):
             return ()
-        if litellm.should_retry(status_code):
-            return ()
+        # Capacity-aware session affinity must not retry a failing pinned backend.
+        # This includes upstream 5xx and worker-local concurrency 429.
+        # Non-retryable status handling remains governed by should_retry_this_error.
         already_skipped_ids: Final = _as_retry_skipped_deployment_ids(already_skipped)
         skipped: Final = tuple(sorted(frozenset((*already_skipped_ids, failed_deployment_id))))
         verbose_router_logger.debug(
@@ -8451,6 +8457,17 @@ class Router:
             deployment_id: Final = model_info.get("id", None)
             if model_group is None or deployment_id is None or self.get_deployment(model_id=str(deployment_id)) is None:
                 return
+
+            if self.session_affinity_capacity_aware:
+                try:
+                    affinity_cb = next(
+                        (cb for cb in (self.optional_callbacks or [])
+                         if isinstance(cb, DeploymentAffinityCheck)), None
+                    )
+                    if affinity_cb is not None:
+                        await affinity_cb.async_repin_after_success(litellm_params)
+                except Exception as error:
+                    verbose_router_logger.debug("Session affinity CAS failed: %s", error)
 
             # Always track deployment successes for cooldown logic, regardless of TPM/RPM limits
             increment_deployment_successes_for_current_minute(

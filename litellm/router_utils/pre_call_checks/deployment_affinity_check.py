@@ -27,6 +27,7 @@ from litellm.caching.affinity_cache import (
     set_local_affinity_pin,
 )
 from litellm.caching.dual_cache import DualCache
+from litellm.router_utils.client_initalization_utils import MaxParallelRequestsLimit
 from litellm.constants import SESSION_DEPLOYMENT_AFFINITY_TTL_METADATA_KEY, SESSION_ID_GENERATED_METADATA_KEY
 from litellm.integrations.custom_logger import CustomLogger, Span
 from litellm.responses.utils import ResponsesAPIRequestUtils
@@ -86,6 +87,7 @@ class DeploymentAffinityCheck(CustomLogger):
         enable_session_id_affinity: bool = False,
         model_group_affinity_config: dict[str, list[str]] | None = None,
         is_priority_group: Callable[[str], bool] | None = None,
+        capacity_aware: bool = False,
     ):
         super().__init__()
         self.cache = cache
@@ -95,6 +97,7 @@ class DeploymentAffinityCheck(CustomLogger):
         self.enable_session_id_affinity = enable_session_id_affinity
         self.model_group_affinity_config: dict[str, list[str]] = model_group_affinity_config or {}
         self.is_priority_group = is_priority_group
+        self.capacity_aware = capacity_aware
 
     def _get_effective_flags(self, model_group: str) -> tuple[bool, bool, bool]:
         """
@@ -352,6 +355,52 @@ class DeploymentAffinityCheck(CustomLogger):
         return None
 
     @with_service_target(ROUTER_SESSION_PINS_TARGET)
+    def _has_capacity(self, deployment: Mapping[str, object]) -> bool:
+        """Use the actual worker-local semaphore source, not least-busy telemetry."""
+        info = deployment.get("model_info")
+        model_id = info.get("id") if isinstance(info, Mapping) else None
+        if model_id is None:
+            return True
+        limit = self.cache.get_cache(
+            key=f"{model_id}_max_parallel_requests_client", local_only=True
+        )
+        return not isinstance(limit, MaxParallelRequestsLimit) or limit.in_flight < limit.max_parallel_requests
+
+    async def async_repin_after_success(self, kwargs: Mapping[str, object]) -> None:
+        """CAS the session pin only for a completed overflow or retry selection."""
+        if not self.capacity_aware:
+            return
+        buckets = self._iter_metadata_dicts(kwargs)
+        expected = next(
+            (m.get("_session_affinity_repin_expected") for m in buckets
+             if isinstance(m.get("_session_affinity_repin_expected"), str)), None
+        )
+        if not expected:
+            return
+        group = next(
+            (m.get("deployment_model_name") for m in buckets
+             if isinstance(m.get("deployment_model_name"), str)), None
+        )
+        if not group:
+            return
+        session_id = self._get_session_id_from_request_kwargs(dict(kwargs))
+        if not session_id:
+            return
+        info = kwargs.get("model_info")
+        if not isinstance(info, Mapping):
+            info = next((m.get("model_info") for m in buckets if isinstance(m.get("model_info"), Mapping)), None)
+        target = info.get("id") if isinstance(info, Mapping) else None
+        if target is None or str(target) == expected:
+            return
+        from litellm.caching.affinity_cache import compare_and_swap_affinity_pin
+        cache_key = self.get_session_affinity_cache_key(
+            model_group=group,
+            session_id=session_id,
+            user_key=self.get_user_key_from_request_kwargs(dict(kwargs)),
+        )
+        ttl = self._get_marker_session_affinity_ttl(dict(kwargs)) or self.ttl_seconds
+        await compare_and_swap_affinity_pin(self.cache, cache_key, expected, str(target), ttl)
+
     async def async_filter_deployments(
         self,
         model: str,
@@ -367,6 +416,8 @@ class DeploymentAffinityCheck(CustomLogger):
         """
         request_kwargs = request_kwargs or {}
         typed_healthy_deployments: Final = cast(list[dict], healthy_deployments)
+        # Preserve Responses continuation, explicit targeting, and priority semantics.
+        # Capacity filtering happens after their early-return checks.
         if request_kwargs.get("_target_order") is not None:
             return typed_healthy_deployments
 
@@ -395,6 +446,13 @@ class DeploymentAffinityCheck(CustomLogger):
 
         if self.is_priority_group is not None and self.is_priority_group(model):
             return typed_healthy_deployments
+
+        # Do not pass already-exhausted workers to the configured strategy.
+        # Keep the original list when all are full to preserve existing errors.
+        if self.capacity_aware:
+            eligible = [d for d in typed_healthy_deployments if self._has_capacity(d)]
+            if eligible:
+                typed_healthy_deployments = eligible
 
         stable_model_map_key: Final = self._get_stable_model_map_key_from_deployments(
             healthy_deployments=typed_healthy_deployments
@@ -426,6 +484,14 @@ class DeploymentAffinityCheck(CustomLogger):
                 elif isinstance(session_cache_result, str):
                     session_model_id = session_cache_result
 
+                # This request has already tried these backends. Never select
+                # a failed sticky origin again on a retry, even before cooldown.
+                skipped = request_kwargs.get("_retry_skipped_deployment_ids") or ()
+                if not isinstance(skipped, (tuple, list, set, frozenset)):
+                    skipped = ()
+                if self.capacity_aware and session_model_id and session_model_id in skipped:
+                    session_model_id = None
+
                 if session_model_id:
                     session_deployment: Final = self._find_deployment_by_model_id(
                         healthy_deployments=typed_healthy_deployments,
@@ -439,6 +505,12 @@ class DeploymentAffinityCheck(CustomLogger):
                         )
                         return [session_deployment]
                     else:
+                        if self.capacity_aware:
+                            # Stash the observed old pin for a success-only CAS.
+                            for bucket in ("metadata", "litellm_metadata"):
+                                metadata = request_kwargs.get(bucket)
+                                if isinstance(metadata, dict):
+                                    metadata["_session_affinity_repin_expected"] = session_model_id
                         verbose_router_logger.debug(
                             "DeploymentAffinityCheck: session-id pinned deployment=%s not found in healthy_deployments",
                             session_model_id,
