@@ -33,8 +33,6 @@ jobs:
           enable-cache: true
       - name: Install locked development dependencies
         run: uv sync --frozen --no-install-project
-      - name: Generate Prisma client
-        run: uv run --no-sync prisma generate --schema litellm/proxy/schema.prisma
       - name: Run focused routing tests
         shell: bash
         run: |
