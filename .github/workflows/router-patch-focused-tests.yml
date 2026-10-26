@@ -1,0 +1,55 @@
+name: Router patch focused tests
+
+on:
+  pull_request:
+    paths:
+      - "litellm/router.py"
+      - "litellm/router_strategy/least_busy.py"
+      - "litellm/router_utils/pre_call_checks/deployment_affinity_check.py"
+      - "litellm/caching/affinity_cache.py"
+      - "tests/unit/router_strategy/test_weighted_least_busy.py"
+      - "tests/unit/router_utils/pre_call_checks/test_session_affinity_capacity.py"
+      - "tests/unit/router_utils/pre_call_checks/test_session_affinity_repin.py"
+      - ".github/workflows/router-patch-focused-tests.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  focused-router-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      LITELLM_LOCAL_MODEL_COST_MAP: "True"
+      UV_PYTHON: "3.12"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - name: Install locked development dependencies
+        run: uv sync --frozen
+      - name: Generate Prisma client
+        run: uv run --no-sync prisma generate --schema litellm/proxy/schema.prisma
+      - name: Run focused routing tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          candidates=(
+            tests/unit/router_strategy/test_weighted_least_busy.py
+            tests/unit/router_utils/pre_call_checks/test_session_affinity_capacity.py
+            tests/unit/router_utils/pre_call_checks/test_session_affinity_repin.py
+          )
+          selected=()
+          for f in "${candidates[@]}"; do
+            if [[ -f "$f" ]]; then selected+=("$f"); fi
+          done
+          if (( ${#selected[@]} == 0 )); then
+            echo "No focused tests found" >&2
+            exit 1
+          fi
+          uv run --no-sync pytest -q --tb=short "${selected[@]}"
