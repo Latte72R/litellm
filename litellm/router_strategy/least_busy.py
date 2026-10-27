@@ -10,6 +10,7 @@ from litellm._logging import verbose_router_logger
 from litellm.caching.caching import DualCache
 from litellm.caching.redis_cache import log_redis_failure
 from litellm.integrations.custom_logger import CustomLogger
+from litellm.router_strategy.simple_shuffle import simple_shuffle
 from litellm.router_utils.batch_utils import is_batch_retrieve_call_type
 
 IN_FLIGHT_COUNT_TTL_SECONDS: Final = 60 * 60
@@ -85,11 +86,27 @@ def _local_counts(raw: object, keys: tuple[str, ...]) -> tuple[int, ...]:
 
 
 def _least_busy(
-    healthy_deployments: Sequence[Mapping[str, object]], counts: tuple[int, ...]
+    healthy_deployments: Sequence[Mapping[str, object]],
+    counts: tuple[int, ...],
+    *,
+    weighted: bool = False,
+    model_group: str = "",
+    request_kwargs: Mapping[str, object] | None = None,
 ) -> Mapping[str, object] | None:
     if not healthy_deployments:
         return None
-    return healthy_deployments[min(range(len(healthy_deployments)), key=lambda index: counts[index])]
+    minimum = min(counts)
+    if not weighted:
+        return healthy_deployments[counts.index(minimum)]
+    candidates = tuple(d for d, count in zip(healthy_deployments, counts) if count == minimum)
+    if len(candidates) == 1:
+        return candidates[0]
+    return simple_shuffle(
+        resolve_model_alias=lambda _: None,
+        healthy_deployments=candidates,
+        model=model_group,
+        request_kwargs=request_kwargs,
+    )
 
 
 def _warn_unreadable(model_group: str, error: Exception) -> None:
@@ -116,8 +133,9 @@ class LeastBusyLoggingHandler(CustomLogger):
     logged_success: int = 0
     logged_failure: int = 0
 
-    def __init__(self, router_cache: DualCache):
+    def __init__(self, router_cache: DualCache, weighted: bool = False):
         self.router_cache = router_cache
+        self.weighted = weighted
         self.router_cache_id = str(id(router_cache))
 
     @with_service_target("router_usage")
@@ -158,7 +176,10 @@ class LeastBusyLoggingHandler(CustomLogger):
 
     @with_service_target("router_usage")
     def get_available_deployments(
-        self, model_group: str, healthy_deployments: Sequence[Mapping[str, object]]
+        self,
+        model_group: str,
+        healthy_deployments: Sequence[Mapping[str, object]],
+        request_kwargs: Mapping[str, object] | None = None,
     ) -> Mapping[str, object] | None:
         keys: Final = _request_count_keys(model_group, healthy_deployments)
         redis_cache: Final = self.router_cache.redis_cache
@@ -168,13 +189,28 @@ class LeastBusyLoggingHandler(CustomLogger):
             except Exception as e:
                 _warn_unreadable(model_group, e)
             else:
-                return _least_busy(healthy_deployments, shared)
+                return _least_busy(
+                    healthy_deployments,
+                    shared,
+                    weighted=self.weighted,
+                    model_group=model_group,
+                    request_kwargs=request_kwargs,
+                )
         local: Final = _local_counts(self.router_cache.batch_get_cache(list(keys), local_only=True), keys)
-        return _least_busy(healthy_deployments, local)
+        return _least_busy(
+            healthy_deployments,
+            local,
+            weighted=self.weighted,
+            model_group=model_group,
+            request_kwargs=request_kwargs,
+        )
 
     @with_service_target("router_usage")
     async def async_get_available_deployments(
-        self, model_group: str, healthy_deployments: Sequence[Mapping[str, object]]
+        self,
+        model_group: str,
+        healthy_deployments: Sequence[Mapping[str, object]],
+        request_kwargs: Mapping[str, object] | None = None,
     ) -> Mapping[str, object] | None:
         keys: Final = _request_count_keys(model_group, healthy_deployments)
         redis_cache: Final = self.router_cache.redis_cache
@@ -184,9 +220,21 @@ class LeastBusyLoggingHandler(CustomLogger):
             except Exception as e:
                 _warn_unreadable(model_group, e)
             else:
-                return _least_busy(healthy_deployments, shared)
+                return _least_busy(
+                    healthy_deployments,
+                    shared,
+                    weighted=self.weighted,
+                    model_group=model_group,
+                    request_kwargs=request_kwargs,
+                )
         local: Final = _local_counts(await self.router_cache.async_batch_get_cache(list(keys), local_only=True), keys)
-        return _least_busy(healthy_deployments, local)
+        return _least_busy(
+            healthy_deployments,
+            local,
+            weighted=self.weighted,
+            model_group=model_group,
+            request_kwargs=request_kwargs,
+        )
 
     def _increment(self, kwargs: Mapping[str, object], delta: int) -> None:
         ref: Final = _deployment_ref(kwargs)
