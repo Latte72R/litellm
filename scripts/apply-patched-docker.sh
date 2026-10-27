@@ -33,7 +33,7 @@ printf 'Starting dependency services ...\n'
 
 printf 'Creating stopped LiteLLM container ...\n'
 "${compose[@]}" stop "$service"
-"${compose[@]}" create --force-recreate --no-deps "$service"
+"${compose[@]}" up --no-start --no-deps --force-recreate "$service"
 cid="$("${compose[@]}" ps -a -q "$service")"
 [[ -n "$cid" ]] || die "Unable to get container ID for $service"
 image="$(docker container inspect --format '{{.Config.Image}}' "$cid")"
