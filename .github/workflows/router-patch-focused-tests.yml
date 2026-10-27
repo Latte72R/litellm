@@ -1,6 +1,8 @@
 name: Router patch focused tests
 
 on:
+  push:
+    branches: ["v1.106.4-patched"]
   pull_request:
     paths:
       - "litellm/router.py"
